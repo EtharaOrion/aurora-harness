@@ -143,9 +143,6 @@ aws configure set aws_secret_access_key "$AWS_ACCESS_SECRET_KEY"
 aws configure set region ap-south-1
 ```
 
-`.env` (repo root, never committed) must also carry `GITHUB_TOKEN` for the
-publish preflight.
-
 ### Before every run: the OAuth bridge
 
 The bridge (port 8765) fronts the Anthropic API with your Claude-subscription
@@ -180,7 +177,7 @@ EGRESS_FILTER_DISABLE=1 RUBRIC_ENABLE=1 bash run_eval.sh \
   --llm-config .llm_config/claude-code.json \
   --dataset path/to/tortoise__tortoise-orm_dataset.jsonl \
   --ecr-prefix <account>.dkr.ecr.<region>.amazonaws.com/<repo-prefix> \
-  --lang python --no-push --data-dir ../milo-bench-dataset
+  --lang python --data-dir ../milo-bench-dataset
 
 # Go example (dapr): same command with --lang go and the dapr dataset file.
 ```
@@ -193,7 +190,7 @@ EGRESS_FILTER_DISABLE=1 RUBRIC_ENABLE=1 bash run_eval.sh \
 | `--dataset` | The team's dataset file — multi-instance files are split automatically, missing `number_interval` is backfilled from the registry |
 | `--ecr-prefix` | Registry holding the pre-built task images (login happens inside the script) |
 | `--lang` | Task repo language (`python`, `go`, ...); else auto-detected per file |
-| `--no-push --data-dir DIR` | Stage into a local clone of the publish repo (default `EtharaOrion/milo-bench-samples`). NOTE: git commit/push automation is disabled by design in all modes — publishing is always a manual `git add/commit/push` from the clone |
+| `--data-dir DIR` | Pre-existing local directory for staging output (default `../milo-bench-dataset`). Must already exist as a writable directory. No git operations are performed; publish manually with `cd <dir> && git add <uuid> && git commit && git push` |
 | `--parallel N` | Instances run concurrently (default 1; 2–3 max on a laptop — each instance can spawn ~5 containers, and parallelism burns the subscription cap N× faster) |
 | `-k N` | Runs per instance (pass@k; default 1) |
 
@@ -235,7 +232,7 @@ edit this to `172.17.0.1:<port>` — while `rubric-judge.json` uses `127.0.0.1`
 
 - `eval_outputs/` — per-instance working dirs (trajectory, eval, harbor, logs). Regenerable; safe to delete between runs.
 - `milo_bundles/<uuid>/` — the deliverable milo bundles (trajectory + verifier + rubric). Wiped between fresh runs.
-- `<data-dir>/<uuid>/` — the same bundle staged flat into the publish clone (`milo-bench-samples` format), accumulating across runs; push manually from there. (Legacy `dataset/`+`trajectory/` split is staged only when no bundle exists, e.g. `RUBRIC_ENABLE=0`.)
+- `<data-dir>/<uuid>/` — the same bundle staged flat into the local staging directory (`milo-bench-samples` format), accumulating across runs; no git operations are performed — publish manually from there. (Legacy `dataset/`+`trajectory/` split is staged only when no bundle exists, e.g. `RUBRIC_ENABLE=0`.)
 
 ## Rich Logging
 

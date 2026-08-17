@@ -12,6 +12,7 @@ Requirements tested:
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 import textwrap
@@ -195,6 +196,59 @@ def test_no_env_file_reading(run_eval_src: str):
 def test_uuid_child_dirs_still_created(run_eval_src: str):
     """stage_dataset must still create UUID-keyed child directories."""
     assert 'd_bundle="$PUBLISH_BASE/$uuid"' in run_eval_src
+
+
+@pytest.fixture(scope="module")
+def readme_src() -> str:
+    return (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+
+# ── README must not document removed publishing behavior ─────────────────────
+# The README twice drifted back to documenting --no-push and a GITHUB_TOKEN
+# publish preflight after both were removed from run_eval.sh, so the documented
+# canonical invocation failed with "Unknown option". These tests keep the
+# onboarding docs in step with the parser.
+
+
+def test_readme_has_no_removed_publishing_flags(readme_src: str):
+    """README must not document flags the parser now rejects."""
+    for option in ("--no-push", "--data-repo", "--git-branch", "--env-file"):
+        assert option not in readme_src, (
+            f"README documents {option}, which run_eval.sh rejects as unknown"
+        )
+
+
+def test_readme_pipeline_section_has_no_token_preflight(readme_src: str):
+    """The run_eval pipeline section must not require a GitHub token.
+
+    Scoped to that section so unrelated GitHub docs (e.g. the cloud-eval
+    dispatch workflow) stay free to mention their own secrets.
+    """
+    section = readme_src[
+        readme_src.index(
+            "## Running the Multi-SWE-bench milo pipeline"
+        ) : readme_src.index("## Rich Logging")
+    ]
+    assert "GITHUB_TOKEN" not in section
+    assert "GH_TOKEN" not in section
+
+
+def test_readme_documented_flags_exist_in_parser(readme_src: str, run_eval_src: str):
+    """Every long flag documented in the run section must exist in the parser."""
+    section = readme_src[
+        readme_src.index("### The run") : readme_src.index("### Which model does what")
+    ]
+    documented = sorted(set(re.findall(r"--[A-Za-z][A-Za-z0-9-]*", section)))
+    assert documented, "no flags found in the README run section"
+
+    parser_start = run_eval_src.index("while [[ $# -gt 0 ]]; do")
+    parser_block = run_eval_src[
+        parser_start : run_eval_src.index("\ndone", parser_start)
+    ]
+    for flag in documented:
+        assert f"{flag})" in parser_block, (
+            f"README documents {flag}, absent from the run_eval.sh parser"
+        )
 
 
 # ── Syntax validation ────────────────────────────────────────────────────────
