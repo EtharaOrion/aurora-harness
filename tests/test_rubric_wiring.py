@@ -90,11 +90,14 @@ class TestRunEvalWiring:
         legacy_idx = body.index('cp -R "$harbor_out/task/."')
         assert src_idx < copy_idx < legacy_idx
 
-    def test_publish_repo_default_is_samples(self, run_eval_src: str):
-        assert (
-            'DATA_REPO="https://github.com/EtharaOrion/milo-bench-samples"'
-            in run_eval_src
-        )
+    def test_staging_uses_local_directory_contract(self, run_eval_src: str):
+        """run_eval.sh stages into a pre-existing local directory (--data-dir)
+        without any git clone, fetch, pull, add, commit, or push operations."""
+        assert 'DATA_PUBLISH_DIR="${SCRIPT_DIR}/../milo-bench-dataset"' in run_eval_src
+        # No git clone of publish repo
+        assert "git clone" not in run_eval_src
+        # No GitHub API verification
+        assert "api.github.com" not in run_eval_src
 
     def test_syntax_parses(self):
         import subprocess

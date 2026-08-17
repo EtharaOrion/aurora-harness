@@ -10,14 +10,12 @@ set -uo pipefail
 # one instance/bundle and gets its own harbor export under <tag>_harbor/.
 #
 # After each dataset finishes, its finished milo bundle (milo_bundles/<uuid>)
-# is staged FLAT into the publish clone as <uuid>/ (milo-bench-samples format);
+# is staged FLAT into the staging directory as <uuid>/ (milo-bench-samples format);
 # when no bundle exists (RUBRIC_ENABLE=0) the legacy harbor split
-# dataset/<uuid>/ + trajectory/<uuid>/ is staged instead. The publish repo
-# (default https://github.com/EtharaOrion/milo-bench-samples) is cloned on
-# startup into <script dir>/../milo-bench-dataset/ if missing. The GitHub token
-# is read from a .env file at the repo root (GITHUB_TOKEN or GH_TOKEN), falling
-# back to those environment variables. Staging is file copies ONLY -- all git
-# commit/push automation is disabled per request; publish manually.
+# dataset/<uuid>/ + trajectory/<uuid>/ is staged instead. The staging directory
+# (default <script dir>/../milo-bench-dataset/) must already exist as a writable
+# directory before the run starts. No git operations are performed on this
+# directory; publish manually when ready.
 #
 # Each dataset runs in its own subshell, so its image names, env exports
 # (EVAL_DOCKER_IMAGE_PREFIX / MULTI_SWE_BENCH_SKIP_BUILD / DOCKER_PLATFORM) and
@@ -53,10 +51,6 @@ DOCKER_BUILD_ONLY=false
 FORCE=false
 DATASETS=()
 DATA_PUBLISH_DIR=""
-DATA_REPO="https://github.com/EtharaOrion/milo-bench-samples"
-GIT_BRANCH=""
-NO_PUSH=false
-ENV_FILE=""
 COMPRESSION="none"
 HEADROOM_PORT=8787
 HEADROOM_BIND_HOST="0.0.0.0"
@@ -120,8 +114,7 @@ Output / stages:
   --force                   Re-run datasets even if their reports already exist
                             (default: resume -- skip datasets/runs already done)
 
-Publishing (staging only -- all git commit/push automation is deliberately
-disabled; publish manually from the clone when ready):
+Staging (local only -- no git operations are performed; publish manually):
   Each finished instance is staged into <data-dir>/ keyed by the dataset uuid:
     <uuid>/              (flat milo bundle, milo-bench-samples format --
                           preferred; used whenever milo_bundles/<uuid> exists,
@@ -130,20 +123,10 @@ disabled; publish manually from the clone when ready):
                          (legacy harbor split -- fallback when no bundle
                           exists, e.g. RUBRIC_ENABLE=0)
   <uuid> is the dataset record's required uuid field. Local eval_outputs/ on
-  disk is left untouched.
-  --data-dir PATH           Local clone of the publish repo (created on start if missing)
+  disk is left untouched. The --data-dir must already exist as a writable
+  directory before the run starts.
+  --data-dir PATH           Pre-existing local directory for staging output
                             (default: <script dir>/../milo-bench-dataset/)
-  --data-repo URL           Publish repo URL; cloned to --data-dir on start if missing,
-                            otherwise the existing clone's origin must match this URL
-                            (default: https://github.com/EtharaOrion/milo-bench-samples)
-  --git-branch NAME         Branch push would target (push is disabled)     [default: current branch]
-  --env-file PATH           .env file to read the GitHub token from
-                            (default: <repo root>/.env, else <script dir>/.env)
-  --no-push                 Also skip GitHub token verification at startup.
-                            NOTE: commits and pushes never happen automatically in
-                            either mode (disabled per request); staging is plain
-                            file copies into the clone's working tree. Publish by
-                            hand: cd <data-dir> && git add <uuid> && git commit && git push.
                             Any single file >=100 MiB is dropped from the staged
                             copy (GitHub hard limit).
 
@@ -229,10 +212,6 @@ while [[ $# -gt 0 ]]; do
         --docker-build-only) DOCKER_BUILD_ONLY=true; shift ;;
         --force)             FORCE=true;             shift ;;
         --data-dir)          DATA_PUBLISH_DIR="$2";  shift 2 ;;
-        --data-repo)         DATA_REPO="$2";         shift 2 ;;
-        --git-branch)        GIT_BRANCH="$2";        shift 2 ;;
-        --no-push)           NO_PUSH=true;           shift ;;
-        --env-file)          ENV_FILE="$2";          shift 2 ;;
         --compression)       COMPRESSION="$2";       shift 2 ;;
         --headroom-port)     HEADROOM_PORT="$2";     shift 2 ;;
         --headroom-bind-host)      HEADROOM_BIND_HOST="$2";      shift 2 ;;
@@ -272,6 +251,65 @@ fi
 if [[ -z "$HEADROOM_ADVERTISE_HOST" ]]; then
     HEADROOM_ADVERTISE_HOST="host.docker.internal"
 fi
+
+# ── Data-dir setup: local staging only (no git operations) ──────────────────
+# Layout at the data-dir root, keyed by dataset uuid:
+#   <uuid>/              (flat milo bundle, milo-bench-samples format -- preferred)
+#   dataset/<uuid>/ + trajectory/<uuid>/   (legacy harbor split -- fallback when
+#                                           no bundle exists, e.g. RUBRIC_ENABLE=0)
+# <uuid> is the dataset record's required uuid field. The directory must already
+# exist and be writable; no automatic clone or mkdir is performed.
+
+if [[ -z "$DATA_PUBLISH_DIR" ]]; then
+    DATA_PUBLISH_DIR="${SCRIPT_DIR}/../milo-bench-dataset"
+fi
+
+# Preserve the user-supplied (or default) path for error messages before
+# canonicalization; validation runs against the ORIGINAL value so messages
+# are actionable (the user sees the path they actually typed).
+_DATA_DIR_ORIG="$DATA_PUBLISH_DIR"
+
+# Validate data-dir: must exist (-e), be a directory (-d), be writable (-w),
+# and be searchable (-x) BEFORE any expensive work (uv sync, ECR login,
+# Docker builds, eval). Each condition is tested separately with a distinct
+# actionable message. No mkdir -p is ever performed on DATA_PUBLISH_DIR or
+# PUBLISH_BASE — the directory must already exist.
+if [[ ! -e "$_DATA_DIR_ORIG" ]]; then
+    echo "ERROR: --data-dir path does not exist: $_DATA_DIR_ORIG" >&2
+    echo "       The staging directory must already exist before starting a run." >&2
+    echo "       Create it with: mkdir -p \"$_DATA_DIR_ORIG\"" >&2
+    echo "       Or specify an existing directory with --data-dir PATH" >&2
+    exit 1
+fi
+if [[ ! -d "$_DATA_DIR_ORIG" ]]; then
+    echo "ERROR: --data-dir is not a directory: $_DATA_DIR_ORIG" >&2
+    echo "       The staging path must be a directory, not a file." >&2
+    echo "       Remove the file and create a directory: rm \"$_DATA_DIR_ORIG\" && mkdir -p \"$_DATA_DIR_ORIG\"" >&2
+    exit 1
+fi
+if [[ ! -w "$_DATA_DIR_ORIG" ]]; then
+    echo "ERROR: --data-dir is not writable: $_DATA_DIR_ORIG" >&2
+    echo "       The staging directory must be writable by the current user." >&2
+    echo "       Fix permissions with: chmod u+w \"$_DATA_DIR_ORIG\"" >&2
+    exit 1
+fi
+if [[ ! -x "$_DATA_DIR_ORIG" ]]; then
+    echo "ERROR: --data-dir is not searchable (missing execute permission): $_DATA_DIR_ORIG" >&2
+    echo "       Directories require the execute bit to list and traverse contents." >&2
+    echo "       Fix permissions with: chmod u+x \"$_DATA_DIR_ORIG\"" >&2
+    exit 1
+fi
+
+# Resolve to absolute path for downstream use. Guard the cd&&pwd so a race or
+# mount disappearance reports the original path instead of a cryptic subshell error.
+if ! DATA_PUBLISH_DIR="$(cd "$_DATA_DIR_ORIG" && pwd)"; then
+    echo "ERROR: --data-dir could not be resolved to an absolute path: $_DATA_DIR_ORIG" >&2
+    echo "       The directory may have been removed or unmounted after validation passed." >&2
+    exit 1
+fi
+
+PUBLISH_BASE="$DATA_PUBLISH_DIR"
+echo "Staging base: $PUBLISH_BASE  (<uuid>/ flat milo bundle; legacy dataset/+trajectory/ split when no bundle)"
 
 # ── Refresh multi-swe-bench to latest main (targeted upgrade) ────────────────
 # pyproject.toml pins multi-swe-bench to `branch = "main"`; this picks up any
@@ -394,164 +432,6 @@ mkdir -p "$DATA_DIR"
 LOG_DIR="${OUTPUT_BASE}/_parallel_logs"
 mkdir -p "$LOG_DIR"
 RESULTS_FILE="$(mktemp "${TMPDIR:-/tmp}/run_eval_results.XXXXXX")"
-
-# ── Publish setup: clone the publish repo; staging is file copies only ──
-# Layout at the data-dir's git toplevel, keyed by dataset uuid:
-#   <uuid>/              (flat milo bundle, milo-bench-samples format -- preferred)
-#   dataset/<uuid>/ + trajectory/<uuid>/   (legacy harbor split -- fallback when
-#                                           no bundle exists, e.g. RUBRIC_ENABLE=0)
-# <uuid> is the dataset record's required uuid field. The publish repo (default
-# https://github.com/EtharaOrion/milo-bench-samples) is cloned into --data-dir
-# on startup if missing. The token builds an authenticated URL that is NEVER
-# written to .git/config or logged. All git commit/push automation is disabled
-# per request (see the three DISABLED sentinels) -- publish manually from the
-# clone. With --no-push, token verification is skipped too.
-
-read_env_var() {
-    [[ -f "$1" ]] || return 0
-    local line val
-    line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$2[[:space:]]*=" "$1" 2>/dev/null | tail -n1)
-    [[ -z "$line" ]] && return 0
-    val="${line#*=}"
-    val="${val#"${val%%[![:space:]]*}"}"
-    case "$val" in
-        \"*) val="${val#\"}"; val="${val%%\"*}" ;;
-        \'*) val="${val#\'}"; val="${val%%\'*}" ;;
-        *)   val="${val%%[[:space:]]*}" ;;
-    esac
-    printf '%s' "$val"
-}
-
-# Drop scheme + x-access-token credentials, lowercase host, trim trailing .git.
-# Used to verify an existing clone's origin matches --data-repo across https/ssh
-# forms and with or without an embedded token.
-_normalize_git_url() {
-    local u="$1"
-    u="${u%.git}"
-    case "$u" in
-        https://x-access-token:*@github.com/*) u="github.com/${u#https://x-access-token:*@github.com/}" ;;
-        https://*@github.com/*)                u="github.com/${u#https://*@github.com/}" ;;
-        https://github.com/*)                  u="github.com/${u#https://github.com/}" ;;
-        git@github.com:*)                      u="github.com/${u#git@github.com:}" ;;
-    esac
-    printf '%s' "$u" | tr '[:upper:]' '[:lower:]'
-}
-
-# Build https://x-access-token:<token>@github.com/<path> from any github URL form.
-# Falls back to the original URL if there is no token or the host isn't github.
-_authed_url() {
-    local origin="$1" token="$2"
-    [[ -z "$token" ]] && { printf '%s' "$origin"; return; }
-    case "$origin" in
-        https://github.com/*)   printf 'https://x-access-token:%s@github.com/%s' "$token" "${origin#https://github.com/}" ;;
-        git@github.com:*)       printf 'https://x-access-token:%s@github.com/%s' "$token" "${origin#git@github.com:}" ;;
-        https://*@github.com/*) printf 'https://x-access-token:%s@github.com/%s' "$token" "${origin#https://*@github.com/}" ;;
-        *)                      printf '%s' "$origin" ;;
-    esac
-}
-
-# Pre-flight: validate PAT against DATA_REPO and overwrite GIT_NAME/GIT_EMAIL
-# with the token owner's identity so commits aren't attributed to a shared bot.
-# No-op under --no-push (local-only dev needs no token).
-verify_github_token_and_identity() {
-    [[ "$NO_PUSH" == true ]] && return 0
-
-    if [[ -z "$GIT_TOKEN" ]]; then
-        echo "ERROR: GITHUB_TOKEN/GH_TOKEN missing in .env and environment." >&2
-        echo "       The script needs a PAT to push to ${DATA_REPO}." >&2
-        echo "       Set GITHUB_TOKEN in .env, or pass --no-push to skip pushing." >&2
-        exit 1
-    fi
-    if ! command -v curl >/dev/null 2>&1; then
-        echo "ERROR: curl is required for GitHub token verification (or pass --no-push)." >&2
-        exit 1
-    fi
-
-    echo "Publish: verifying GitHub token from ${GIT_TOKEN_SRC}..."
-
-    local user_body user_code
-    user_body="$(mktemp "${TMPDIR:-/tmp}/gh_user.XXXXXX.json")"
-    user_code="$(curl -sS -o "$user_body" -w '%{http_code}' \
-        --max-time 10 \
-        -H "Authorization: token ${GIT_TOKEN}" \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/user" 2>/dev/null || echo "000")"
-    case "$user_code" in
-        200) ;;
-        401) echo "ERROR: GitHub token is invalid or expired. Regenerate at github.com/settings/tokens." >&2; rm -f "$user_body"; exit 1 ;;
-        403) echo "ERROR: GitHub token forbidden on /user (HTTP 403)." >&2
-             echo "       Causes: classic PAT missing 'user' scope; fine-grained PAT without account-level 'User: Read' permission; or rate-limited." >&2
-             rm -f "$user_body"; exit 1 ;;
-        000) echo "ERROR: GitHub API unreachable. Check network, or pass --no-push." >&2; rm -f "$user_body"; exit 1 ;;
-        *)   echo "ERROR: GitHub /user returned HTTP ${user_code}." >&2; rm -f "$user_body"; exit 1 ;;
-    esac
-
-    local identity_lines
-    identity_lines="$(python3 - "$user_body" <<'PYSCRIPT' 2>/dev/null
-import json, sys
-with open(sys.argv[1]) as f:
-    d = json.load(f)
-login = d.get("login") or ""
-uid   = d.get("id")
-name  = d.get("name") or login
-print(name)
-print(login)
-print(uid if uid is not None else "")
-PYSCRIPT
-    )"
-    rm -f "$user_body"
-    local api_name api_login api_id
-    api_name="$(printf '%s' "$identity_lines" | sed -n '1p')"
-    api_login="$(printf '%s' "$identity_lines" | sed -n '2p')"
-    api_id="$(printf '%s' "$identity_lines" | sed -n '3p')"
-    if [[ -z "$api_login" || -z "$api_id" ]]; then
-        echo "ERROR: GitHub /user response missing login/id; cannot derive identity." >&2
-        exit 1
-    fi
-
-    local repo_path
-    repo_path="$(printf '%s' "$DATA_REPO" | sed -E 's#\.git$##; s#^https://[^@]*@github\.com/##; s#^https://github\.com/##; s#^git@github\.com:##; s#/$##')"
-    if [[ -z "$repo_path" || "$repo_path" != */* ]]; then
-        echo "ERROR: cannot parse owner/repo from DATA_REPO=${DATA_REPO}." >&2
-        exit 1
-    fi
-
-    local repo_body repo_code
-    repo_body="$(mktemp "${TMPDIR:-/tmp}/gh_repo.XXXXXX.json")"
-    repo_code="$(curl -sS -o "$repo_body" -w '%{http_code}' \
-        --max-time 10 \
-        -H "Authorization: token ${GIT_TOKEN}" \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/${repo_path}" 2>/dev/null || echo "000")"
-    case "$repo_code" in
-        200) ;;
-        401) echo "ERROR: token rejected when querying ${repo_path}." >&2; rm -f "$repo_body"; exit 1 ;;
-        403) echo "ERROR: token forbidden on ${repo_path} (needs 'repo' scope)." >&2; rm -f "$repo_body"; exit 1 ;;
-        404) echo "ERROR: ${repo_path} not found, or token cannot see it (user @${api_login})." >&2; rm -f "$repo_body"; exit 1 ;;
-        000) echo "ERROR: GitHub API unreachable while checking ${repo_path}." >&2; rm -f "$repo_body"; exit 1 ;;
-        *)   echo "ERROR: GitHub /repos/${repo_path} returned HTTP ${repo_code}." >&2; rm -f "$repo_body"; exit 1 ;;
-    esac
-
-    local has_push
-    has_push="$(python3 - "$repo_body" <<'PYSCRIPT' 2>/dev/null
-import json, sys
-with open(sys.argv[1]) as f:
-    d = json.load(f)
-print("yes" if (d.get("permissions") or {}).get("push") else "no")
-PYSCRIPT
-    )"
-    rm -f "$repo_body"
-    if [[ "$has_push" != "yes" ]]; then
-        echo "ERROR: token (user @${api_login}) lacks write access to ${repo_path}." >&2
-        echo "       Generate a PAT with 'repo' scope, or request collaborator access." >&2
-        exit 1
-    fi
-
-    GIT_NAME="$api_name"
-    GIT_EMAIL="${api_id}+${api_login}@users.noreply.github.com"
-    echo "Publish: token OK (user @${api_login}, write access on ${repo_path})"
-    echo "Publish: commit identity -> ${GIT_NAME} <${GIT_EMAIL}>"
-}
 
 mk_temp_llm_config() {
     local src="$1" new_base="$2"
@@ -697,116 +577,6 @@ _headroom_watchdog() {
         done
     done
 }
-
-REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")"
-
-ENV_FILE_RESOLVED=""
-if [[ -n "$ENV_FILE" ]]; then
-    ENV_FILE_RESOLVED="$ENV_FILE"
-elif [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.env" ]]; then
-    ENV_FILE_RESOLVED="$REPO_ROOT/.env"
-elif [[ -f "$SCRIPT_DIR/.env" ]]; then
-    ENV_FILE_RESOLVED="$SCRIPT_DIR/.env"
-fi
-
-GIT_TOKEN=""
-GIT_TOKEN_SRC="none"
-if [[ -n "$ENV_FILE_RESOLVED" ]]; then
-    GIT_TOKEN="$(read_env_var "$ENV_FILE_RESOLVED" GITHUB_TOKEN)"
-    [[ -z "$GIT_TOKEN" ]] && GIT_TOKEN="$(read_env_var "$ENV_FILE_RESOLVED" GH_TOKEN)"
-    [[ -n "$GIT_TOKEN" ]] && GIT_TOKEN_SRC=".env ($ENV_FILE_RESOLVED)"
-fi
-if [[ -z "$GIT_TOKEN" ]]; then
-    GIT_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-    [[ -n "$GIT_TOKEN" ]] && GIT_TOKEN_SRC="environment"
-fi
-
-if [[ -z "$DATA_PUBLISH_DIR" ]]; then
-    DATA_PUBLISH_DIR="${SCRIPT_DIR}/../milo-bench-dataset"
-fi
-
-DATA_REPO_ROOT=""
-DATA_CLONE_OK=false
-PUSH_ENABLED=false
-GIT_REMOTE_AUTHED=""
-GIT_REMOTE_DISPLAY="$DATA_REPO"
-GIT_NAME="${GIT_AUTHOR_NAME:-milo-eval-bot}"
-GIT_EMAIL="${GIT_AUTHOR_EMAIL:-milo-eval-bot@users.noreply.github.com}"
-PUSH_LOCK="${TMPDIR:-/tmp}/run_eval_push.lock"
-rm -rf "$PUSH_LOCK" 2>/dev/null
-
-verify_github_token_and_identity
-
-if [[ ! -d "$DATA_PUBLISH_DIR" ]] || ! git -C "$DATA_PUBLISH_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-    if [[ -z "$GIT_TOKEN" ]]; then
-        echo "ERROR: --data-dir missing and no GITHUB_TOKEN/GH_TOKEN to clone $DATA_REPO"
-        exit 1
-    fi
-    mkdir -p "$(dirname "$DATA_PUBLISH_DIR")"
-    CLONE_URL="$(_authed_url "$DATA_REPO" "$GIT_TOKEN")"
-    echo "Publish: cloning $DATA_REPO -> $DATA_PUBLISH_DIR"
-    if git clone "$CLONE_URL" "$DATA_PUBLISH_DIR" >/dev/null 2>&1; then
-        DATA_CLONE_OK=true
-    else
-        echo "ERROR: failed to clone $DATA_REPO -> $DATA_PUBLISH_DIR"
-        exit 1
-    fi
-else
-    EXISTING_ORIGIN="$(git -C "$DATA_PUBLISH_DIR" remote get-url origin 2>/dev/null || echo "")"
-    if [[ -z "$EXISTING_ORIGIN" ]]; then
-        echo "ERROR: --data-dir $DATA_PUBLISH_DIR has no 'origin' remote"
-        exit 1
-    fi
-    if [[ "$(_normalize_git_url "$EXISTING_ORIGIN")" != "$(_normalize_git_url "$DATA_REPO")" ]]; then
-        echo "ERROR: --data-dir clone origin $EXISTING_ORIGIN does not match --data-repo $DATA_REPO"
-        exit 1
-    fi
-    DATA_CLONE_OK=true
-fi
-
-DATA_REPO_ROOT="$(git -C "$DATA_PUBLISH_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")"
-if [[ -z "$DATA_REPO_ROOT" ]]; then
-    echo "Publish: --data-dir is not a git clone; staging locally, skipping push."
-    DATA_CLONE_OK=false
-    DATA_REPO_ROOT="$(cd "$DATA_PUBLISH_DIR" && pwd)"
-fi
-
-PUBLISH_BASE="$DATA_REPO_ROOT"
-mkdir -p "$PUBLISH_BASE"
-echo "Publish base: $PUBLISH_BASE  (<uuid>/ flat milo bundle; legacy dataset/+trajectory/ split when no bundle)"
-
-if [[ "$DATA_CLONE_OK" == true ]]; then
-    GIT_BRANCH="${GIT_BRANCH:-$(git -C "$DATA_REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)}"
-    if false && [[ "$NO_PUSH" != true ]]; then  # DISABLED: auto startup fetch/pull-rebase (commented out per request)
-        git -C "$DATA_REPO_ROOT" fetch origin "$GIT_BRANCH" >/dev/null 2>&1 || \
-            echo "Publish: WARN fetch origin/$GIT_BRANCH failed; continuing with current tree"
-        git -C "$DATA_REPO_ROOT" -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" \
-            pull --rebase --autostash origin "$GIT_BRANCH" >/dev/null 2>&1 || \
-            echo "Publish: WARN pull --rebase --autostash failed; continuing (local commits preserved)"
-    fi
-fi
-
-if [[ "$NO_PUSH" == true ]]; then
-    echo "Publish: --no-push set; staging locally, not pushing."
-elif [[ "$DATA_CLONE_OK" != true ]]; then
-    echo "Publish: dataset clone unavailable; staging locally, skipping push."
-elif [[ "$PUBLISH_BASE" != "$DATA_REPO_ROOT" && "$PUBLISH_BASE" != "$DATA_REPO_ROOT"/* ]]; then
-    echo "Publish: publish base is outside the dataset clone ($DATA_REPO_ROOT); staging locally, skipping push."
-else
-    ORIGIN_URL="$(git -C "$DATA_REPO_ROOT" remote get-url origin 2>/dev/null || echo "")"
-    if [[ -z "$ORIGIN_URL" ]]; then
-        echo "Publish: no 'origin' remote on dataset clone; staging locally, skipping push."
-    else
-        GIT_REMOTE_DISPLAY="$ORIGIN_URL"
-        if [[ -n "$GIT_TOKEN" ]]; then
-            GIT_REMOTE_AUTHED="$(_authed_url "$ORIGIN_URL" "$GIT_TOKEN")"
-            echo "Publish: enabled (token from ${GIT_TOKEN_SRC}) -> ${GIT_REMOTE_DISPLAY} [branch ${GIT_BRANCH}]"
-        else
-            echo "Publish: no token in .env or GITHUB_TOKEN/GH_TOKEN; will try existing git credentials -> ${GIT_REMOTE_DISPLAY} [branch ${GIT_BRANCH}]"
-        fi
-        PUSH_ENABLED=true
-    fi
-fi
 
 # One ECR login up front (the harness assumes you're already authenticated).
 if [[ -n "$ECR_PREFIX" ]]; then
@@ -983,10 +753,9 @@ with open(out_path, "w") as f:
 PYSCRIPT
 }
 
-# Commit-lock serializes parallel subshells writing to the shared git index.
+# Stage the dataset into the publish directory.
 # $1=tag  $2=instance_id  $3=dataset_path  $4=run_base(model dir)  $5=harbor_out  $6=model  $7=dataset_uuid
-# Args 3,4,6 (dataset_path, run_base, model) are accepted for signature stability
-# but no longer copied to the staged push.
+# Args 3,4,6 (dataset_path, run_base, model) are accepted for signature stability.
 stage_dataset() {
     local tag="$1" iid="$2" dataset="$3" run_base="$4" harbor_out="$5" model="$6" dataset_uuid="$7"
     [[ -z "${PUBLISH_BASE:-}" ]] && return 0
@@ -1064,34 +833,7 @@ stage_dataset() {
     done < <(find "$d_bundle" "$d_dataset" "$d_traj" -type f -size +$((LARGE_LIMIT_BYTES - 1))c 2>/dev/null)
     [[ $_bign -gt 0 ]] && log "data: skipped $_bign file(s) >=100MiB for uuid=$uuid (not pushed)"
 
-    # Per-dataset local commit. Serialized via a separate mkdir lock (independent
-    # of $PUSH_LOCK) so parallel subshells don't race on the shared git index.
-    if false && [[ "${DATA_REPO_ROOT:-}" != "" && -d "$DATA_REPO_ROOT/.git" ]]; then  # DISABLED: auto per-task git commit (commented out per request)
-        local _commit_lock="${TMPDIR:-/tmp}/run_eval_commit.lock"
-        local _commit_waited=0
-        until mkdir "$_commit_lock" 2>/dev/null; do
-            sleep 0.1
-            _commit_waited=$((_commit_waited + 1))
-            if [[ $_commit_waited -gt 6000 ]]; then
-                log "data: ERROR could not acquire commit lock for uuid=$uuid after ~10min; SKIPPING COMMIT (data NOT published)"
-                log "data: this typically means another parallel run is holding the lock or crashed mid-commit"
-                log "data: investigate ${TMPDIR:-/tmp}/run_eval_commit.lock and the other run's state before retrying"
-                echo "${TAG_NAME}|commit-lock-timeout|" >> "$RESULTS_FILE"
-                return 1
-            fi
-        done
-        git -C "$DATA_REPO_ROOT" add -- "dataset/$uuid" "trajectory/$uuid" >/dev/null 2>&1 || true
-        if git -C "$DATA_REPO_ROOT" diff --cached --quiet -- "dataset/$uuid" "trajectory/$uuid" 2>/dev/null; then
-            log "data: uuid=$uuid already committed or no changes"
-        elif git -C "$DATA_REPO_ROOT" \
-                  -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" \
-                  commit -q -m "data: $uuid ($iid)" -- "dataset/$uuid" "trajectory/$uuid" >/dev/null 2>&1; then
-            log "data: committed uuid=$uuid"
-        else
-            log "data: WARN commit failed for uuid=$uuid; staged but uncommitted"
-        fi
-        rmdir "$_commit_lock" 2>/dev/null || rm -rf "$_commit_lock" 2>/dev/null
-    fi
+    return 0
 }
 
 # ── Per-dataset pipeline (runs in its own subshell) ──────────────────────────
@@ -1556,7 +1298,7 @@ print(proxy)
 }
 
 # ── Clean shutdown ───────────────────────────────────────────────────────────
-trap 'echo; echo "Interrupted -- killing jobs"; kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; rm -f "$RESULTS_FILE" 2>/dev/null; rm -rf "$PUSH_LOCK" "${TMPDIR:-/tmp}/run_eval_commit.lock" 2>/dev/null; exit 130' INT TERM
+trap 'echo; echo "Interrupted -- killing jobs"; kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; rm -f "$RESULTS_FILE" 2>/dev/null; exit 130' INT TERM
 
 # ── Dispatch with a rolling concurrency window (keeps --parallel busy) ───────
 echo "═══════════════════════════════════════════════════════════════"
@@ -1584,54 +1326,6 @@ for ds in "${DATASETS[@]}"; do
     PIDS+=("$!")
 done
 wait
-
-# ── Final push of every per-dataset commit ──────────────────────────────────
-# Commits were created per-dataset inside stage_dataset; here we just ship them.
-if [[ "$NO_PUSH" == true ]]; then
-    echo "Publish: --no-push set; skipping final push (local commits preserved at $DATA_REPO_ROOT)."
-elif [[ "$PUSH_ENABLED" != true ]]; then
-    echo "Publish: push not enabled; skipping final push."
-elif false; then  # DISABLED: auto final push (commented out per request; commits kept local)
-    _waited=0
-    _lock_ok=false
-    until mkdir "$PUSH_LOCK" 2>/dev/null; do
-        sleep 0.3; _waited=$((_waited+1))
-        if [[ $_waited -gt 2000 ]]; then
-            echo "Publish: WARN could not acquire push lock after ~10min"
-            break
-        fi
-    done
-    [[ -d "$PUSH_LOCK" ]] && _lock_ok=true
-
-    if [[ "$_lock_ok" == true ]]; then
-        git -C "$DATA_REPO_ROOT" fetch origin "$GIT_BRANCH" >/dev/null 2>&1 || \
-            echo "Publish: WARN final fetch failed"
-        git -C "$DATA_REPO_ROOT" -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" \
-            pull --rebase --autostash origin "$GIT_BRANCH" >/dev/null 2>&1 || \
-            echo "Publish: WARN final pull --rebase --autostash failed; attempting push anyway"
-
-        _ahead=$(git -C "$DATA_REPO_ROOT" rev-list --count "HEAD" "^origin/$GIT_BRANCH" 2>/dev/null || echo 0)
-        if [[ "${_ahead:-0}" -eq 0 ]]; then
-            echo "Publish: no new commits to push"
-        else
-            _target="${GIT_REMOTE_AUTHED:-origin}"
-            echo "Publish: pushing $_ahead commit(s) to $GIT_REMOTE_DISPLAY [$GIT_BRANCH]"
-            if git -C "$DATA_REPO_ROOT" push "$_target" "HEAD:$GIT_BRANCH" >/dev/null 2>&1; then
-                echo "Publish: push OK ($_ahead commit(s))"
-            else
-                echo "Publish: push failed (non-fast-forward?); pulling and retrying once"
-                git -C "$DATA_REPO_ROOT" -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" \
-                    pull --rebase --autostash "$_target" "$GIT_BRANCH" >/dev/null 2>&1 || true
-                if git -C "$DATA_REPO_ROOT" push "$_target" "HEAD:$GIT_BRANCH" >/dev/null 2>&1; then
-                    echo "Publish: push OK on retry"
-                else
-                    echo "Publish: WARN push failed twice; $_ahead commit(s) kept locally at $DATA_REPO_ROOT"
-                fi
-            fi
-        fi
-        rmdir "$PUSH_LOCK" 2>/dev/null || rm -rf "$PUSH_LOCK" 2>/dev/null
-    fi
-fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
