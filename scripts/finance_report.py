@@ -247,7 +247,7 @@ def build_payload(
 
     budget_type = _env("FINANCE_BUDGET_TYPE", "RFP")
     rfp_sub_type = _env("FINANCE_RFP_SUB_TYPE", "Testing")
-    production_mode = _env("FINANCE_PRODUCTION_MODE", "Singlephase")
+    production_mode = _env("FINANCE_PRODUCTION_MODE", "")
 
     return {
         "project_id": _env("FINANCE_PROJECT_ID", "PRJ-UNSET"),
