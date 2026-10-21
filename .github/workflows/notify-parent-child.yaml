@@ -1,0 +1,42 @@
+# Written into every roster child repository by trinity/tools/kickoff.py (new and retrofit), never
+# by gate.py install, so no lane checkout carries an installed file (ADR 0081). A push to main
+# dispatches submodule-updated to the parent named by the TRINITY_PARENT repository variable, and
+# the parent's bump-submodules workflow advances this child's gitlink (ADR 0112). Do not hand-edit.
+
+name: notify-parent
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch submodule-updated to the parent
+        env:
+          PARENT: ${{ vars.TRINITY_PARENT }}
+          GH_TOKEN: ${{ secrets.PARENT_DISPATCH_TOKEN }}
+          SOURCE_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${PARENT}" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "::error::TRINITY_PARENT must name the parent as owner/name."
+            exit 1
+          fi
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::PARENT_DISPATCH_TOKEN is unset, so the parent cannot be notified."
+            exit 1
+          fi
+          gh api --method POST "repos/${PARENT}/dispatches" \
+            -f event_type=submodule-updated \
+            -f "client_payload[repo]=${SOURCE_REPO}" \
+            -f "client_payload[sha]=${SOURCE_SHA}" \
+            -f "client_payload[ref]=${SOURCE_REF}"
+          echo "Notified ${PARENT} of ${SOURCE_REPO} @ ${SOURCE_SHA}."
